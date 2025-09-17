@@ -100,31 +100,18 @@ static struct rmib_node net_inet6_raw6_node =
 void
 rawsock_init(void)
 {
-	initialize_free_list();
-	initialize_active_list();
-	register_mib_subtrees();
-}
-
-static void
-initialize_free_list(void)
-{
 	unsigned int slot;
 
+	/* Initialize the list of free RAW sockets. */
 	TAILQ_INIT(&raw_freelist);
 
 	for (slot = 0; slot < __arraycount(raw_array); slot++)
 		TAILQ_INSERT_TAIL(&raw_freelist, &raw_array[slot], raw_next);
-}
 
-static void
-initialize_active_list(void)
-{
+	/* Initialize the list of active RAW sockets. */
 	TAILQ_INIT(&raw_activelist);
-}
 
-static void
-register_mib_subtrees(void)
-{
+	/* Register the net.inet.raw and net.inet6.raw6 RMIB subtrees. */
 	mibtree_register_inet(PF_INET, IPPROTO_RAW, &net_inet_raw_node);
 	mibtree_register_inet(PF_INET6, IPPROTO_RAW, &net_inet6_raw6_node);
 }
@@ -133,61 +120,42 @@ register_mib_subtrees(void)
  * Check whether the given arrived IPv6 packet is fit to be received on the
  * given raw socket.
  */
-static int is_icmpv6_packet_too_small(struct pbuf *pbuf)
-{
-    return pbuf->len < offsetof(struct icmp6_hdr, icmp6_dataun);
-}
-
-static int is_icmpv6_type_filtered(struct rawsock *raw, struct pbuf *pbuf)
-{
-    uint8_t type;
-    
-    memcpy(&type, &((struct icmp6_hdr *)pbuf->payload)->icmp6_type,
-        sizeof(type));
-    
-    return !ICMP6_FILTER_WILLPASS((int)type, &raw->raw_icmp6filter);
-}
-
-static int should_filter_icmpv6(struct rawsock *raw, struct pbuf *pbuf)
-{
-    if (raw->raw_pcb->protocol != IPPROTO_ICMPV6)
-        return FALSE;
-    
-    if (is_icmpv6_packet_too_small(pbuf))
-        return TRUE;
-    
-    return is_icmpv6_type_filtered(raw, pbuf);
-}
-
-static int is_checksum_invalid(struct raw_pcb *pcb, struct pbuf *pbuf)
-{
-    if (pbuf->tot_len < pcb->chksum_offset + sizeof(uint16_t))
-        return TRUE;
-    
-    return ip6_chksum_pseudo(pbuf, pcb->protocol, pbuf->tot_len,
-        ip6_current_src_addr(), ip6_current_dest_addr()) != 0;
-}
-
-static int should_verify_checksum(struct rawsock *raw, struct pbuf *pbuf)
-{
-    if (!raw->raw_pcb->chksum_reqd)
-        return FALSE;
-    
-    return is_checksum_invalid(raw->raw_pcb, pbuf);
-}
-
 static int
-rawsock_check_v6(struct rawsock *raw, struct pbuf *pbuf)
+rawsock_check_v6(struct rawsock * raw, struct pbuf * pbuf)
 {
-    assert(rawsock_is_ipv6(raw));
-    
-    if (should_filter_icmpv6(raw, pbuf))
-        return FALSE;
-    
-    if (should_verify_checksum(raw, pbuf))
-        return FALSE;
-    
-    return TRUE;
+	uint8_t type;
+
+	assert(rawsock_is_ipv6(raw));
+
+	/*
+	 * For ICMPv6 packets, test against the configured type filter.
+	 */
+	if (raw->raw_pcb->protocol == IPPROTO_ICMPV6) {
+		if (pbuf->len < offsetof(struct icmp6_hdr, icmp6_dataun))
+			return FALSE;
+
+		memcpy(&type, &((struct icmp6_hdr *)pbuf->payload)->icmp6_type,
+		    sizeof(type));
+
+		if (!ICMP6_FILTER_WILLPASS((int)type, &raw->raw_icmp6filter))
+			return FALSE;
+	}
+
+	/*
+	 * For ICMPv6 packets, or if IPV6_CHECKSUM is enabled, we have to
+	 * verify the checksum of the packet before passing it to the user.
+	 * This is costly, but it needs to be done and lwIP is not doing it for
+	 * us (as of writing, anyway), even though it maintains the offset..
+	 */
+	if (raw->raw_pcb->chksum_reqd &&
+	    (pbuf->tot_len < raw->raw_pcb->chksum_offset + sizeof(uint16_t) ||
+	    ip6_chksum_pseudo(pbuf, raw->raw_pcb->protocol, pbuf->tot_len,
+	    ip6_current_src_addr(), ip6_current_dest_addr()) != 0)) {
+		return FALSE;
+	}
+
+	/* No reason to filter out this packet. */
+	return TRUE;
 }
 
 /*
@@ -196,19 +164,22 @@ rawsock_check_v6(struct rawsock *raw, struct pbuf *pbuf)
  * the swapping part of the preparation done on IPv4 packets being sent if the
  * IP_HDRINCL socket option is enabled.
  */
-static void swap_ip_header_fields(struct ip_hdr *iphdr)
+static void
+rawsock_adjust_v4(struct pbuf * pbuf)
 {
-    IPH_LEN(iphdr) = htons(IPH_LEN(iphdr));
-    IPH_OFFSET(iphdr) = htons(IPH_OFFSET(iphdr));
-}
+	struct ip_hdr *iphdr;
 
-static void rawsock_adjust_v4(struct pbuf * pbuf)
-{
-    if (pbuf->len < sizeof(struct ip_hdr))
-        return;
+	if (pbuf->len < sizeof(struct ip_hdr))
+		return;
 
-    struct ip_hdr *iphdr = (struct ip_hdr *)pbuf->payload;
-    swap_ip_header_fields(iphdr);
+	iphdr = (struct ip_hdr *)pbuf->payload;
+
+	/*
+	 * W. Richard Stevens also mentions ip_id, but at least on NetBSD that
+	 * field seems to be swapped neither when sending nor when receiving..
+	 */
+	IPH_LEN(iphdr) = htons(IPH_LEN(iphdr));
+	IPH_OFFSET(iphdr) = htons(IPH_OFFSET(iphdr));
 }
 
 /*
@@ -217,79 +188,6 @@ static void rawsock_adjust_v4(struct pbuf * pbuf)
  * this function.  As such, we must make a copy of the given packet if we want
  * to keep it, and never free it.
  */
-static uint8_t
-restore_header_if_needed(struct pbuf *psrc, int off)
-{
-	if (off > 0)
-		util_pbuf_header(psrc, off);
-	return 0;
-}
-
-static int
-validate_input_buffer(struct rawsock *raw, struct pbuf *psrc)
-{
-	int hdrlen = pktsock_test_input(&raw->raw_pktsock, psrc);
-	if (hdrlen < 0)
-		return -1;
-	return hdrlen;
-}
-
-static int
-process_ipv6_packet(struct rawsock *raw, struct pbuf *psrc)
-{
-	int off = ip_current_header_tot_len();
-	util_pbuf_header(psrc, -off);
-
-	if (!rawsock_check_v6(raw, psrc)) {
-		util_pbuf_header(psrc, off);
-		return -1;
-	}
-	return off;
-}
-
-static int
-process_ipv4_packet_on_ipv6_socket(struct rawsock *raw)
-{
-	if (raw->raw_pcb->chksum_reqd)
-		return -1;
-	return IP_HLEN;
-}
-
-static int
-determine_header_offset(struct rawsock *raw, struct pbuf *psrc)
-{
-	if (ip_current_is_v6())
-		return process_ipv6_packet(raw, psrc);
-
-	if (rawsock_is_ipv6(raw))
-		return process_ipv4_packet_on_ipv6_socket(raw);
-
-	return 0;
-}
-
-static struct pbuf *
-create_packet_copy(struct pbuf *psrc, int hdrlen)
-{
-	struct pbuf *pbuf = pchain_alloc(PBUF_RAW, hdrlen + psrc->tot_len);
-	if (pbuf == NULL)
-		return NULL;
-
-	util_pbuf_header(pbuf, -hdrlen);
-
-	if (pbuf_copy(pbuf, psrc) != ERR_OK)
-		panic("unexpected pbuf copy failure");
-
-	pbuf->flags |= psrc->flags & (PBUF_FLAG_LLMCAST | PBUF_FLAG_LLBCAST);
-	return pbuf;
-}
-
-static void
-adjust_header_for_ipv4(struct rawsock *raw, struct pbuf *psrc, int off)
-{
-	if (off > 0 && rawsock_is_ipv6(raw))
-		util_pbuf_header(psrc, -off);
-}
-
 static uint8_t
 rawsock_input(void * arg, struct raw_pcb * pcb __unused, struct pbuf * psrc,
 	const ip_addr_t * srcaddr)
@@ -300,19 +198,79 @@ rawsock_input(void * arg, struct raw_pcb * pcb __unused, struct pbuf * psrc,
 
 	assert(raw->raw_pcb == pcb);
 
-	hdrlen = validate_input_buffer(raw, psrc);
-	if (hdrlen < 0)
+	/*
+	 * If adding this packet would cause the receive buffer to go beyond
+	 * the current limit, drop the new packet.  This is just an estimation,
+	 * because the copy we are about to make may not take the exact same
+	 * amount of memory, due to the fact that 1) the pbuf we're given has
+	 * an unknown set of headers in front of it, and 2) we need to store
+	 * extra information in our copy.  The return value of this call, if
+	 * not -1, is the number of bytes we need to reserve to store that
+	 * extra information.
+	 */
+	if ((hdrlen = pktsock_test_input(&raw->raw_pktsock, psrc)) < 0)
 		return 0;
 
-	off = determine_header_offset(raw, psrc);
-	if (off < 0)
+	/*
+	 * Raw IPv6 sockets receive only the actual packet data, whereas raw
+	 * IPv4 sockets receive the IP header as well.
+	 */
+	if (ip_current_is_v6()) {
+		off = ip_current_header_tot_len();
+
+		util_pbuf_header(psrc, -off);
+
+		if (!rawsock_check_v6(raw, psrc)) {
+			util_pbuf_header(psrc, off);
+
+			return 0;
+		}
+	} else {
+		/*
+		 * For IPv6 sockets, drop the packet if it was sent as an IPv4
+		 * packet and checksumming is enabled (this includes ICMPv6).
+		 * Otherwise, the packet would bypass the above checks that we
+		 * perform on IPv6 packets.  Applications that want to use a
+		 * dual-stack protocol with checksumming will have to do the
+		 * checksum verification part themselves.  Presumably the two
+		 * different pseudoheaders would result in different checksums
+		 * anyhow, so it would be useless to try to support that.
+		 *
+		 * Beyond that, for IPv4 packets on IPv6 sockets, hide the IPv4
+		 * header.
+		 */
+		if (rawsock_is_ipv6(raw)) {
+			if (raw->raw_pcb->chksum_reqd)
+				return 0;
+
+			off = IP_HLEN;
+
+			util_pbuf_header(psrc, -off);
+		} else
+			off = 0;
+	}
+
+	/*
+	 * We need to make a copy of the incoming packet.  If we eat the one
+	 * given to us, this will 1) stop any other raw sockets from getting
+	 * the same packet, 2) allow a single raw socket to discard all TCP/UDP
+	 * traffic, and 3) present us with a problem on how to store ancillary
+	 * data.  Raw sockets are not that performance critical so the extra
+	 * copy -even when not always necessary- is not that big of a deal.
+	 */
+	if ((pbuf = pchain_alloc(PBUF_RAW, hdrlen + psrc->tot_len)) == NULL) {
+		if (off > 0)
+			util_pbuf_header(psrc, off);
+
 		return 0;
+	}
 
-	adjust_header_for_ipv4(raw, psrc, off);
+	util_pbuf_header(pbuf, -hdrlen);
 
-	pbuf = create_packet_copy(psrc, hdrlen);
-	if (pbuf == NULL)
-		return restore_header_if_needed(psrc, off);
+	if (pbuf_copy(pbuf, psrc) != ERR_OK)
+		panic("unexpected pbuf copy failure");
+
+	pbuf->flags |= psrc->flags & (PBUF_FLAG_LLMCAST | PBUF_FLAG_LLBCAST);
 
 	if (off > 0)
 		util_pbuf_header(psrc, off);
@@ -333,6 +291,7 @@ rawsock_socket(int domain, int protocol, struct sock ** sockp,
 	const struct sockevent_ops ** ops)
 {
 	struct rawsock *raw;
+	unsigned int flags;
 	uint8_t ip_type;
 
 	if (protocol < 0 || protocol > UINT8_MAX)
@@ -343,81 +302,52 @@ rawsock_socket(int domain, int protocol, struct sock ** sockp,
 
 	raw = TAILQ_FIRST(&raw_freelist);
 
+	/*
+	 * Initialize the structure.  Do not memset it to zero, as it is still
+	 * part of the linked free list.  Initialization may still fail.
+	 */
+
 	ip_type = pktsock_socket(&raw->raw_pktsock, domain, RAW_SNDBUF_DEF,
 	    RAW_RCVBUF_DEF, sockp);
 
-	if (rawsock_init_pcb(raw, ip_type, protocol) != 0)
+	/* We should have enough PCBs so this call should not fail.. */
+	if ((raw->raw_pcb = raw_new_ip_type(ip_type, protocol)) == NULL)
 		return ENOBUFS;
+	raw_recv(raw->raw_pcb, rawsock_input, (void *)raw);
 
-	rawsock_configure_multicast(raw);
+	/* By default, the multicast TTL is 1 and looping is enabled. */
+	raw_set_multicast_ttl(raw->raw_pcb, 1);
 
-	if (rawsock_is_ipv6(raw) && protocol == IPPROTO_ICMPV6)
-		rawsock_setup_icmpv6(raw);
-	else
+	flags = raw_flags(raw->raw_pcb);
+	raw_setflags(raw->raw_pcb, flags | RAW_FLAGS_MULTICAST_LOOP);
+
+	/*
+	 * For ICMPv6, checksum generation and verification is mandatory and
+	 * type filtering of incoming packets is supported (RFC 3542).  For all
+	 * other IPv6 protocols, checksumming may be turned on by the user.
+	 */
+	if (rawsock_is_ipv6(raw) && protocol == IPPROTO_ICMPV6) {
+		raw->raw_pcb->chksum_reqd = 1;
+		raw->raw_pcb->chksum_offset =
+		    offsetof(struct icmp6_hdr, icmp6_cksum);
+
+		ICMP6_FILTER_SETPASSALL(&raw->raw_icmp6filter);
+	} else
 		raw->raw_pcb->chksum_reqd = 0;
 
-	rawsock_activate(raw);
+	TAILQ_REMOVE(&raw_freelist, raw, raw_next);
+
+	TAILQ_INSERT_TAIL(&raw_activelist, raw, raw_next);
 
 	*ops = &rawsock_ops;
 	return SOCKID_RAW | (sockid_t)(raw - raw_array);
 }
 
-static int
-rawsock_init_pcb(struct rawsock *raw, uint8_t ip_type, int protocol)
-{
-	raw->raw_pcb = raw_new_ip_type(ip_type, protocol);
-	if (raw->raw_pcb == NULL)
-		return -1;
-	
-	raw_recv(raw->raw_pcb, rawsock_input, (void *)raw);
-	return 0;
-}
-
-static void
-rawsock_configure_multicast(struct rawsock *raw)
-{
-	unsigned int flags;
-	
-	raw_set_multicast_ttl(raw->raw_pcb, 1);
-	flags = raw_flags(raw->raw_pcb);
-	raw_setflags(raw->raw_pcb, flags | RAW_FLAGS_MULTICAST_LOOP);
-}
-
-static void
-rawsock_setup_icmpv6(struct rawsock *raw)
-{
-	raw->raw_pcb->chksum_reqd = 1;
-	raw->raw_pcb->chksum_offset = offsetof(struct icmp6_hdr, icmp6_cksum);
-	ICMP6_FILTER_SETPASSALL(&raw->raw_icmp6filter);
-}
-
-static void
-rawsock_activate(struct rawsock *raw)
-{
-	TAILQ_REMOVE(&raw_freelist, raw, raw_next);
-	TAILQ_INSERT_TAIL(&raw_activelist, raw, raw_next);
-}
-
 /*
  * Bind a raw socket to a local address.
  */
-static int validate_connection_state(struct rawsock *raw)
-{
-	if (rawsock_is_conn(raw))
-		return EINVAL;
-	return OK;
-}
-
-static int get_binding_address(struct rawsock *raw, const struct sockaddr *addr,
-	socklen_t addr_len, endpoint_t user_endpt, ip_addr_t *ipaddr)
-{
-	return ipsock_get_src_addr(rawsock_get_ipsock(raw), addr, addr_len,
-	    user_endpt, &raw->raw_pcb->local_ip, 0,
-	    TRUE, ipaddr, NULL);
-}
-
 static int
-rawsock_bind(struct sock *sock, const struct sockaddr *addr,
+rawsock_bind(struct sock * sock, const struct sockaddr * addr,
 	socklen_t addr_len, endpoint_t user_endpt)
 {
 	struct rawsock *raw = (struct rawsock *)sock;
@@ -425,12 +355,19 @@ rawsock_bind(struct sock *sock, const struct sockaddr *addr,
 	err_t err;
 	int r;
 
-	r = validate_connection_state(raw);
-	if (r != OK)
-		return r;
+	/*
+	 * Raw sockets may be rebound even if that is not too useful.  However,
+	 * we do not allow (re)binding when the socket is connected, so as to
+	 * eliminate any problems with source and destination type mismatches:
+	 * such mismatches are detected at connect time, and rebinding would
+	 * avoid those, possibly triggering lwIP asserts as a result.
+	 */
+	if (rawsock_is_conn(raw))
+		return EINVAL;
 
-	r = get_binding_address(raw, addr, addr_len, user_endpt, &ipaddr);
-	if (r != OK)
+	if ((r = ipsock_get_src_addr(rawsock_get_ipsock(raw), addr, addr_len,
+	    user_endpt, &raw->raw_pcb->local_ip, 0 /*local_port*/,
+	    TRUE /*allow_mcast*/, &ipaddr, NULL /*portp*/)) != OK)
 		return r;
 
 	err = raw_bind(raw->raw_pcb, &ipaddr);
@@ -441,132 +378,102 @@ rawsock_bind(struct sock *sock, const struct sockaddr *addr,
 /*
  * Connect a raw socket to a remote address.
  */
-static int handle_unspec_address(struct rawsock *raw, const struct sockaddr *addr, socklen_t addr_len)
-{
-    if (addr_is_unspec(addr, addr_len)) {
-        raw_disconnect(raw->raw_pcb);
-        return OK;
-    }
-    return -1;
-}
-
-static struct ifdev* get_multicast_interface(struct rawsock *raw, const ip_addr_t *dst_addr)
-{
-    uint32_t ifindex, ifindex2;
-    
-    if (!ip_addr_ismulticast(dst_addr))
-        return NULL;
-    
-    ifindex = pktsock_get_ifindex(&raw->raw_pktsock);
-    ifindex2 = raw_get_multicast_netif_index(raw->raw_pcb);
-    
-    if (ifindex == 0)
-        ifindex = ifindex2;
-    
-    if (ifindex != 0)
-        return ifdev_get_by_index(ifindex);
-    
-    return NULL;
-}
-
-static int bind_to_source_address(struct rawsock *raw, const ip_addr_t *dst_addr)
-{
-    const ip_addr_t *src_addr;
-    struct ifdev *ifdev;
-    err_t err;
-    
-    if (!ip_addr_isany(&raw->raw_pcb->local_ip))
-        return OK;
-    
-    ifdev = get_multicast_interface(raw, dst_addr);
-    
-    if (ifdev != NULL && ifdev_get_by_index(pktsock_get_ifindex(&raw->raw_pktsock)) == NULL)
-        return ENXIO;
-    
-    src_addr = ifaddr_select(dst_addr, ifdev, NULL);
-    
-    if (src_addr == NULL)
-        return EHOSTUNREACH;
-    
-    err = raw_bind(raw->raw_pcb, src_addr);
-    
-    if (err != ERR_OK)
-        return util_convert_err(err);
-    
-    return OK;
-}
-
 static int
 rawsock_connect(struct sock * sock, const struct sockaddr * addr,
-    socklen_t addr_len, endpoint_t user_endpt __unused)
+	socklen_t addr_len, endpoint_t user_endpt __unused)
 {
-    struct rawsock *raw = (struct rawsock *)sock;
-    ip_addr_t dst_addr;
-    err_t err;
-    int r;
-    
-    r = handle_unspec_address(raw, addr, addr_len);
-    if (r >= 0)
-        return r;
-    
-    r = ipsock_get_dst_addr(rawsock_get_ipsock(raw), addr, addr_len,
-        &raw->raw_pcb->local_ip, &dst_addr, NULL);
-    if (r != OK)
-        return r;
-    
-    r = bind_to_source_address(raw, &dst_addr);
-    if (r != OK)
-        return r;
-    
-    err = raw_connect(raw->raw_pcb, &dst_addr);
-    
-    if (err != ERR_OK)
-        return util_convert_err(err);
-    
-    return OK;
+	struct rawsock *raw = (struct rawsock *)sock;
+	const ip_addr_t *src_addr;
+	ip_addr_t dst_addr;
+	struct ifdev *ifdev;
+	uint32_t ifindex, ifindex2;
+	err_t err;
+	int r;
+
+	/*
+	 * One may "unconnect" socket by providing an address with family
+	 * AF_UNSPEC.
+	 */
+	if (addr_is_unspec(addr, addr_len)) {
+		raw_disconnect(raw->raw_pcb);
+
+		return OK;
+	}
+
+	if ((r = ipsock_get_dst_addr(rawsock_get_ipsock(raw), addr, addr_len,
+	    &raw->raw_pcb->local_ip, &dst_addr, NULL /*dst_port*/)) != OK)
+		return r;
+
+	/*
+	 * Bind explicitly to a source address if the PCB is not bound to one
+	 * yet.  This is expected in the BSD socket API, but lwIP does not do
+	 * it for us.
+	 */
+	if (ip_addr_isany(&raw->raw_pcb->local_ip)) {
+		/* Help the multicast case a bit, if possible. */
+		ifdev = NULL;
+		if (ip_addr_ismulticast(&dst_addr)) {
+			ifindex = pktsock_get_ifindex(&raw->raw_pktsock);
+			ifindex2 = raw_get_multicast_netif_index(raw->raw_pcb);
+			if (ifindex == 0)
+				ifindex = ifindex2;
+
+			if (ifindex != 0) {
+				ifdev = ifdev_get_by_index(ifindex);
+
+				if (ifdev == NULL)
+					return ENXIO;
+			}
+		}
+
+		src_addr = ifaddr_select(&dst_addr, ifdev, NULL /*ifdevp*/);
+
+		if (src_addr == NULL)
+			return EHOSTUNREACH;
+
+		err = raw_bind(raw->raw_pcb, src_addr);
+
+		if (err != ERR_OK)
+			return util_convert_err(err);
+	}
+
+	/*
+	 * Connecting a raw socket serves two main purposes: 1) the socket uses
+	 * the address as destination when sending, and 2) the socket receives
+	 * packets from only the connected address.
+	 */
+	err = raw_connect(raw->raw_pcb, &dst_addr);
+
+	if (err != ERR_OK)
+		return util_convert_err(err);
+
+	return OK;
 }
 
 /*
  * Perform preliminary checks on a send request.
  */
-static int validate_flags(int flags)
-{
-	if ((flags & ~MSG_DONTROUTE) != 0)
-		return EOPNOTSUPP;
-	return OK;
-}
-
-static int validate_destination(struct rawsock *raw, const struct sockaddr *addr)
-{
-	if (!rawsock_is_conn(raw) && addr == NULL)
-		return EDESTADDRREQ;
-	return OK;
-}
-
-static int validate_buffer_size(struct rawsock *raw, size_t len)
-{
-	if (len > ipsock_get_sndbuf(rawsock_get_ipsock(raw)))
-		return EMSGSIZE;
-	return OK;
-}
-
 static int
 rawsock_pre_send(struct sock * sock, size_t len, socklen_t ctl_len __unused,
 	const struct sockaddr * addr, socklen_t addr_len __unused,
 	endpoint_t user_endpt __unused, int flags)
 {
 	struct rawsock *raw = (struct rawsock *)sock;
-	int result;
 
-	result = validate_flags(flags);
-	if (result != OK)
-		return result;
+	if ((flags & ~MSG_DONTROUTE) != 0)
+		return EOPNOTSUPP;
 
-	result = validate_destination(raw, addr);
-	if (result != OK)
-		return result;
+	if (!rawsock_is_conn(raw) && addr == NULL)
+		return EDESTADDRREQ;
 
-	return validate_buffer_size(raw, len);
+	/*
+	 * This is only one part of the length check.  The rest is done from
+	 * rawsock_send(), once we have more information.
+	 */
+	if (len > ipsock_get_sndbuf(rawsock_get_ipsock(raw)))
+		return EMSGSIZE;
+
+	return OK;
 }
 
 /*
@@ -575,32 +482,24 @@ rawsock_pre_send(struct sock * sock, size_t len, socklen_t ctl_len __unused,
  * This function is called twice when sending a packet.  The result is that the
  * flagged options are overridden for only the packet being sent.
  */
-static void swap_tos(struct rawsock * raw, struct pktopt * pkto)
-{
-	uint8_t tos = raw->raw_pcb->tos;
-	raw->raw_pcb->tos = pkto->pkto_tos;
-	pkto->pkto_tos = tos;
-}
-
-static void swap_ttl(struct rawsock * raw, struct pktopt * pkto)
-{
-	uint8_t ttl = raw->raw_pcb->ttl;
-	uint8_t mcast_ttl = raw_get_multicast_ttl(raw->raw_pcb);
-	raw->raw_pcb->ttl = pkto->pkto_ttl;
-	raw_set_multicast_ttl(raw->raw_pcb, pkto->pkto_ttl);
-	pkto->pkto_ttl = ttl;
-	pkto->pkto_mcast_ttl = mcast_ttl;
-}
-
 static void
 rawsock_swap_opt(struct rawsock * raw, struct pktopt * pkto)
 {
+	uint8_t tos, ttl, mcast_ttl;
+
 	if (pkto->pkto_flags & PKTOF_TOS) {
-		swap_tos(raw, pkto);
+		tos = raw->raw_pcb->tos;
+		raw->raw_pcb->tos = pkto->pkto_tos;
+		pkto->pkto_tos = tos;
 	}
 
 	if (pkto->pkto_flags & PKTOF_TTL) {
-		swap_ttl(raw, pkto);
+		ttl = raw->raw_pcb->ttl;
+		mcast_ttl = raw_get_multicast_ttl(raw->raw_pcb);
+		raw->raw_pcb->ttl = pkto->pkto_ttl;
+		raw_set_multicast_ttl(raw->raw_pcb, pkto->pkto_ttl);
+		pkto->pkto_ttl = ttl;
+		pkto->pkto_mcast_ttl = mcast_ttl;
 	}
 }
 
@@ -610,225 +509,52 @@ rawsock_swap_opt(struct rawsock * raw, struct pktopt * pkto)
  * IPv4 header for sending, by modifying a few fields in it, as expected by
  * userland.
  */
-static int validate_ip_header(struct pbuf *pbuf)
+static int
+rawsock_prepare_hdrincl(struct rawsock * raw, struct pbuf * pbuf,
+	const ip_addr_t * src_addr)
 {
-    if (pbuf->len < sizeof(struct ip_hdr))
-        return EINVAL;
-    return OK;
-}
+	struct ip_hdr *iphdr;
+	size_t hlen;
 
-static void set_source_address_if_blank(struct ip_hdr *iphdr, const ip_addr_t *src_addr)
-{
-    if (iphdr->src.addr == PP_HTONL(INADDR_ANY)) {
-        assert(IP_IS_V4(src_addr));
-        iphdr->src.addr = ip_addr_get_ip4_u32(src_addr);
-    }
-}
+	/*
+	 * lwIP obtains the destination address from the IP packet header in
+	 * this case, so make sure the packet has a full-sized header.
+	 */
+	if (pbuf->len < sizeof(struct ip_hdr))
+		return EINVAL;
 
-static void prepare_ip_header_fields(struct ip_hdr *iphdr, size_t hlen)
-{
-    IPH_LEN(iphdr) = htons(IPH_LEN(iphdr));
-    IPH_OFFSET(iphdr) = htons(IPH_OFFSET(iphdr));
-    IPH_CHKSUM(iphdr) = 0;
-    IPH_CHKSUM(iphdr) = inet_chksum(iphdr, hlen);
-}
+	iphdr = (struct ip_hdr *)pbuf->payload;
 
-static int rawsock_prepare_hdrincl(struct rawsock *raw, struct pbuf *pbuf,
-    const ip_addr_t *src_addr)
-{
-    struct ip_hdr *iphdr;
-    size_t hlen;
-    int result;
+	/*
+	 * Fill in the source address if it is not set, and do the byte
+	 * swapping and checksum computation common for the BSDs, without which
+	 * ping(8) and traceroute(8) do not work properly.  We consider this a
+	 * convenience feature, so malformed packets are simply sent as is.
+	 * TODO: deal with type punning..
+	 */
+	hlen = (size_t)IPH_HL(iphdr) << 2;
 
-    result = validate_ip_header(pbuf);
-    if (result != OK)
-        return result;
+	if (pbuf->len >= hlen) {
+		/* Fill in the source address if it is blank. */
+		if (iphdr->src.addr == PP_HTONL(INADDR_ANY)) {
+			assert(IP_IS_V4(src_addr));
 
-    iphdr = (struct ip_hdr *)pbuf->payload;
-    hlen = (size_t)IPH_HL(iphdr) << 2;
+			iphdr->src.addr = ip_addr_get_ip4_u32(src_addr);
+		}
 
-    if (pbuf->len >= hlen) {
-        set_source_address_if_blank(iphdr, src_addr);
-        prepare_ip_header_fields(iphdr, hlen);
-    }
+		IPH_LEN(iphdr) = htons(IPH_LEN(iphdr));
+		IPH_OFFSET(iphdr) = htons(IPH_OFFSET(iphdr));
+		IPH_CHKSUM(iphdr) = 0;
 
-    return OK;
+		IPH_CHKSUM(iphdr) = inet_chksum(iphdr, hlen);
+	}
+
+	return OK;
 }
 
 /*
  * Send a packet on a raw socket.
  */
-static int validate_send_parameters(struct rawsock *raw, size_t len, size_t hdrlen)
-{
-	if (hdrlen + len > RAW_MAX_PAYLOAD)
-		return EMSGSIZE;
-	return OK;
-}
-
-static int setup_source_address(struct rawsock *raw, struct pktopt *pktopt,
-	struct ifdev **ifdev, ip_addr_t *src_addr, const ip_addr_t **src_addrp)
-{
-	int r;
-
-	if ((r = pktsock_get_pktinfo(&raw->raw_pktsock, pktopt, ifdev,
-	    src_addr)) != OK)
-		return r;
-
-	if (*ifdev != NULL && !ip_addr_isany(src_addr)) {
-		*src_addrp = src_addr;
-	} else {
-		*src_addrp = &raw->raw_pcb->local_ip;
-
-		if (ip_addr_ismulticast(*src_addrp))
-			*src_addrp = IP46_ADDR_ANY(IP_GET_TYPE(*src_addrp));
-	}
-	return OK;
-}
-
-static int setup_destination_address(struct rawsock *raw, const struct sockaddr *addr,
-	socklen_t addr_len, const ip_addr_t *src_addrp, ip_addr_t *dst_addr,
-	const ip_addr_t **dst_addrp)
-{
-	int r;
-
-	if (!rawsock_is_conn(raw)) {
-		assert(addr != NULL);
-
-		if ((r = ipsock_get_dst_addr(rawsock_get_ipsock(raw), addr,
-		    addr_len, src_addrp, dst_addr, NULL)) != OK)
-			return r;
-
-		*dst_addrp = dst_addr;
-	} else {
-		*dst_addrp = &raw->raw_pcb->remote_ip;
-	}
-	return OK;
-}
-
-static void setup_multicast_interface(struct rawsock *raw, struct ifdev **ifdev,
-	const ip_addr_t *dst_addrp)
-{
-	uint32_t ifindex;
-
-	if (*ifdev == NULL && ip_addr_ismulticast(dst_addrp)) {
-		ifindex = raw_get_multicast_netif_index(raw->raw_pcb);
-
-		if (ifindex != NETIF_NO_INDEX)
-			*ifdev = ifdev_get_by_index(ifindex);
-	}
-}
-
-static int check_zone_violations(struct ifdev *ifdev, const ip_addr_t *dst_addrp,
-	const ip_addr_t *src_addrp)
-{
-	if (ifdev != NULL && IP_IS_V6(dst_addrp)) {
-		if (ifaddr_is_zone_mismatch(ip_2_ip6(dst_addrp), ifdev))
-			return EHOSTUNREACH;
-
-		if (IP_IS_V6(src_addrp) &&
-		    ifaddr_is_zone_mismatch(ip_2_ip6(src_addrp), ifdev))
-			return EHOSTUNREACH;
-	}
-	return OK;
-}
-
-static int perform_route_lookup(struct ifdev **ifdev, const ip_addr_t **src_addrp,
-	const ip_addr_t *dst_addrp, int flags)
-{
-	struct netif *netif;
-
-	if (*ifdev == NULL) {
-		if (!(flags & MSG_DONTROUTE)) {
-			if (IP_IS_ANY_TYPE_VAL(**src_addrp))
-				*src_addrp = IP46_ADDR_ANY(IP_GET_TYPE(dst_addrp));
-
-			if ((netif = ip_route(*src_addrp, dst_addrp)) == NULL)
-				return EHOSTUNREACH;
-
-			*ifdev = netif_get_ifdev(netif);
-		} else {
-			if ((*ifdev = ifaddr_map_by_subnet(dst_addrp)) == NULL)
-				return EHOSTUNREACH;
-		}
-	}
-	return OK;
-}
-
-static int finalize_source_address(const ip_addr_t **src_addrp,
-	const ip_addr_t *dst_addrp, struct ifdev *ifdev)
-{
-	assert(ifdev != NULL);
-
-	if (ip_addr_isany(*src_addrp)) {
-		*src_addrp = ifaddr_select(dst_addrp, ifdev, NULL);
-
-		if (*src_addrp == NULL)
-			return EHOSTUNREACH;
-	}
-	return OK;
-}
-
-static size_t calculate_header_length(struct rawsock *raw, const ip_addr_t *dst_addrp)
-{
-	if (rawsock_is_hdrincl(raw))
-		return 0;
-	else if (IP_IS_V6(dst_addrp))
-		return IP6_HLEN;
-	else
-		return IP_HLEN;
-}
-
-static int prepare_checksum(struct rawsock *raw, struct pbuf *pbuf)
-{
-	if (raw->raw_pcb->chksum_reqd) {
-		if (pbuf->len < raw->raw_pcb->chksum_offset + sizeof(uint16_t))
-			return EINVAL;
-
-		memset((char *)pbuf->payload + raw->raw_pcb->chksum_offset, 0,
-		    sizeof(uint16_t));
-	}
-	return OK;
-}
-
-static void set_packet_flags(struct pbuf *pbuf, const ip_addr_t *dst_addrp,
-	struct ifdev *ifdev)
-{
-	if (ip_addr_ismulticast(dst_addrp))
-		pbuf->flags |= PBUF_FLAG_LLMCAST;
-	else if (ip_addr_isbroadcast(dst_addrp, ifdev_get_netif(ifdev)))
-		pbuf->flags |= PBUF_FLAG_LLBCAST;
-}
-
-static int allocate_and_fill_pbuf(struct rawsock *raw,
-	const struct sockdriver_data *data, size_t len,
-	const ip_addr_t *src_addrp, struct pbuf **pbuf_out)
-{
-	struct pbuf *pbuf;
-	int r;
-
-	if ((pbuf = pchain_alloc(PBUF_IP, len)) == NULL)
-		return ENOBUFS;
-
-	if ((r = pktsock_get_data(&raw->raw_pktsock, data, len, pbuf)) != OK) {
-		pbuf_free(pbuf);
-		return r;
-	}
-
-	if ((r = prepare_checksum(raw, pbuf)) != OK) {
-		pbuf_free(pbuf);
-		return r;
-	}
-
-	if (rawsock_is_hdrincl(raw) &&
-	    (r = rawsock_prepare_hdrincl(raw, pbuf, src_addrp)) != OK) {
-		pbuf_free(pbuf);
-		return r;
-	}
-
-	*pbuf_out = pbuf;
-	return OK;
-}
-
 static int
 rawsock_send(struct sock * sock, const struct sockdriver_data * data,
 	size_t len, size_t * off, const struct sockdriver_data * ctl __unused,
@@ -840,51 +566,200 @@ rawsock_send(struct sock * sock, const struct sockdriver_data * data,
 	struct pktopt pktopt;
 	struct pbuf *pbuf;
 	struct ifdev *ifdev;
+	struct netif *netif;
 	const ip_addr_t *dst_addrp, *src_addrp;
-	ip_addr_t src_addr, dst_addr;
+	ip_addr_t src_addr, dst_addr; /* for storage only; not always used! */
 	size_t hdrlen;
+	uint32_t ifindex;
 	err_t err;
 	int r;
 
+	/* Copy in and parse any packet options. */
 	pktopt.pkto_flags = 0;
 
 	if ((r = pktsock_get_ctl(&raw->raw_pktsock, ctl, ctl_len,
 	    &pktopt)) != OK)
 		return r;
 
-	if ((r = setup_source_address(raw, &pktopt, &ifdev, &src_addr,
-	    &src_addrp)) != OK)
+	/*
+	 * For a more in-depth explanation of what is going on here, see the
+	 * udpsock module, which has largely the same code but with more
+	 * elaborate comments.
+	 */
+
+	/*
+	 * Start by checking whether the source address and/or the outgoing
+	 * interface are overridden using sticky and/or ancillary options.
+	 */
+	if ((r = pktsock_get_pktinfo(&raw->raw_pktsock, &pktopt, &ifdev,
+	    &src_addr)) != OK)
 		return r;
 
-	if ((r = setup_destination_address(raw, addr, addr_len, src_addrp,
-	    &dst_addr, &dst_addrp)) != OK)
-		return r;
+	if (ifdev != NULL && !ip_addr_isany(&src_addr)) {
+		/* This is guaranteed to be a proper local unicast address. */
+		src_addrp = &src_addr;
+	} else {
+		src_addrp = &raw->raw_pcb->local_ip;
 
-	setup_multicast_interface(raw, &ifdev, dst_addrp);
+		/*
+		 * If the socket is bound to a multicast address, use the
+		 * unspecified ('any') address as source address instead.  A
+		 * real source address will then be selected further below.
+		 */
+		if (ip_addr_ismulticast(src_addrp))
+			src_addrp = IP46_ADDR_ANY(IP_GET_TYPE(src_addrp));
+	}
 
-	if ((r = check_zone_violations(ifdev, dst_addrp, src_addrp)) != OK)
-		return r;
+	/*
+	 * Determine the destination address to use.  If the socket is
+	 * connected, always ignore any address provided in the send call.
+	 */
+	if (!rawsock_is_conn(raw)) {
+		assert(addr != NULL); /* already checked in pre_send */
 
-	if ((r = perform_route_lookup(&ifdev, &src_addrp, dst_addrp,
-	    flags)) != OK)
-		return r;
+		if ((r = ipsock_get_dst_addr(rawsock_get_ipsock(raw), addr,
+		    addr_len, src_addrp, &dst_addr, NULL /*dst_port*/)) != OK)
+			return r;
 
-	if ((r = finalize_source_address(&src_addrp, dst_addrp, ifdev)) != OK)
-		return r;
+		dst_addrp = &dst_addr;
+	} else
+		dst_addrp = &raw->raw_pcb->remote_ip;
 
+	/*
+	 * If the destination is a multicast address, select the outgoing
+	 * interface based on the multicast interface index, if one is set.
+	 * This must however *not* override an interface index already
+	 * specified using IPV6_PKTINFO, as per RFC 3542 Sec. 6.7.
+	 */
+	if (ifdev == NULL && ip_addr_ismulticast(dst_addrp)) {
+		ifindex = raw_get_multicast_netif_index(raw->raw_pcb);
+
+		if (ifindex != NETIF_NO_INDEX)
+			ifdev = ifdev_get_by_index(ifindex); /* (may fail) */
+	}
+
+	/*
+	 * If an interface has been determined already now, the send operation
+	 * will bypass routing.  In that case, we must perform our own checks
+	 * on address zone violations, because those will not be made anywhere
+	 * else.  Subsequent steps below will never introduce violations.
+	 */
+	if (ifdev != NULL && IP_IS_V6(dst_addrp)) {
+		if (ifaddr_is_zone_mismatch(ip_2_ip6(dst_addrp), ifdev))
+			return EHOSTUNREACH;
+
+		if (IP_IS_V6(src_addrp) &&
+		    ifaddr_is_zone_mismatch(ip_2_ip6(src_addrp), ifdev))
+			return EHOSTUNREACH;
+	}
+
+	/*
+	 * If we do not yet have an interface at this point, perform a route
+	 * lookup to determine the outgoing interface, unless MSG_DONTROUTE is
+	 * set.
+	 */
+	if (ifdev == NULL) {
+		if (!(flags & MSG_DONTROUTE)) {
+			/*
+			 * ip_route() should never be called with an
+			 * IPADDR_TYPE_ANY type address.  This is a lwIP-
+			 * internal requirement; while we override both routing
+			 * functions, we do not deviate from it.
+			 */
+			if (IP_IS_ANY_TYPE_VAL(*src_addrp))
+				src_addrp =
+				    IP46_ADDR_ANY(IP_GET_TYPE(dst_addrp));
+
+			/* Perform the route lookup. */
+			if ((netif = ip_route(src_addrp, dst_addrp)) == NULL)
+				return EHOSTUNREACH;
+
+			ifdev = netif_get_ifdev(netif);
+		} else {
+			if ((ifdev = ifaddr_map_by_subnet(dst_addrp)) == NULL)
+				return EHOSTUNREACH;
+		}
+	}
+
+	/*
+	 * At this point we have an outgoing interface.  If we do not have a
+	 * source address yet, pick one now.  As a sidenote, if the destination
+	 * address is scoped but has no zone, we could also fill in the zone
+	 * now.  We let lwIP handle that instead, though.
+	 */
+	assert(ifdev != NULL);
+
+	if (ip_addr_isany(src_addrp)) {
+		src_addrp = ifaddr_select(dst_addrp, ifdev, NULL /*ifdevp*/);
+
+		if (src_addrp == NULL)
+			return EHOSTUNREACH;
+	}
+
+	/*
+	 * Now that we know the full conditions of what we are about to send,
+	 * check whether the packet size leaves enough room for lwIP to prepend
+	 * headers.  If so, allocate a chain of pbufs for the packet.
+	 */
 	assert(len <= RAW_MAX_PAYLOAD);
 
-	hdrlen = calculate_header_length(raw, dst_addrp);
+	if (rawsock_is_hdrincl(raw))
+		hdrlen = 0;
+	else if (IP_IS_V6(dst_addrp))
+		hdrlen = IP6_HLEN;
+	else
+		hdrlen = IP_HLEN;
 
-	if ((r = validate_send_parameters(raw, len, hdrlen)) != OK)
+	if (hdrlen + len > RAW_MAX_PAYLOAD)
+		return EMSGSIZE;
+
+	if ((pbuf = pchain_alloc(PBUF_IP, len)) == NULL)
+		return ENOBUFS;
+
+	/* Copy in the packet data. */
+	if ((r = pktsock_get_data(&raw->raw_pktsock, data, len, pbuf)) != OK) {
+		pbuf_free(pbuf);
+
 		return r;
+	}
 
-	if ((r = allocate_and_fill_pbuf(raw, data, len, src_addrp,
-	    &pbuf)) != OK)
+	/*
+	 * If the user has turned on IPV6_CHECKSUM, ensure that the packet is
+	 * not only large enough to have the checksum stored at the configured
+	 * place, but also that the checksum fits within the first pbuf: if we
+	 * do not test this here, an assert will trigger in lwIP later.  Also
+	 * zero out the checksum field first, because lwIP does not do that.
+	 */
+	if (raw->raw_pcb->chksum_reqd) {
+		if (pbuf->len < raw->raw_pcb->chksum_offset +
+		    sizeof(uint16_t)) {
+			pbuf_free(pbuf);
+
+			return EINVAL;
+		}
+
+		memset((char *)pbuf->payload + raw->raw_pcb->chksum_offset, 0,
+		    sizeof(uint16_t));
+	}
+
+	/*
+	 * For sockets where an IPv4 header is already included in the packet,
+	 * we need to alter a few header fields to be compatible with BSD.
+	 */
+	if (rawsock_is_hdrincl(raw) &&
+	    (r = rawsock_prepare_hdrincl(raw, pbuf, src_addrp)) != OK) {
+		pbuf_free(pbuf);
+
 		return r;
+	}
 
-	set_packet_flags(pbuf, dst_addrp, ifdev);
+	/* Set broadcast/multicast flags for accounting purposes. */
+	if (ip_addr_ismulticast(dst_addrp))
+		pbuf->flags |= PBUF_FLAG_LLMCAST;
+	else if (ip_addr_isbroadcast(dst_addrp, ifdev_get_netif(ifdev)))
+		pbuf->flags |= PBUF_FLAG_LLBCAST;
 
+	/* Send the packet. */
 	rawsock_swap_opt(raw, &pktopt);
 
 	assert(!ip_addr_isany(src_addrp));
@@ -895,8 +770,13 @@ rawsock_send(struct sock * sock, const struct sockdriver_data * data,
 
 	rawsock_swap_opt(raw, &pktopt);
 
+	/* Free the pbuf again. */
 	pbuf_free(pbuf);
 
+	/*
+	 * On success, make sure to return the size of the sent packet as well.
+	 * As an aside: ctl_off need not be updated, as it is not returned.
+	 */
 	if ((r = util_convert_err(err)) == OK)
 		*off = len;
 	return r;
@@ -910,6 +790,10 @@ rawsock_setsockmask(struct sock * sock, unsigned int mask)
 {
 	struct rawsock *raw = (struct rawsock *)sock;
 
+	/*
+	 * FIXME: raw sockets are not supposed to have a broardcast check, so
+	 * perhaps just remove this and instead always set SOF_BROADCAST?
+	 */
 	if (mask & SO_BROADCAST)
 		ip_set_option(raw->raw_pcb, SOF_BROADCAST);
 	else
@@ -922,6 +806,7 @@ rawsock_setsockmask(struct sock * sock, unsigned int mask)
 static void
 rawsock_get_ipopts(struct rawsock * raw, struct ipopts * ipopts)
 {
+
 	ipopts->local_ip = &raw->raw_pcb->local_ip;
 	ipopts->remote_ip = &raw->raw_pcb->remote_ip;
 	ipopts->tos = &raw->raw_pcb->tos;
@@ -935,369 +820,353 @@ rawsock_get_ipopts(struct rawsock * raw, struct ipopts * ipopts)
 /*
  * Set socket options on a raw socket.
  */
-static int copy_and_validate_int(const struct sockdriver_data *data, socklen_t len, int *val)
-{
-	return sockdriver_copyin_opt(data, val, sizeof(*val), len);
-}
-
-static int copy_and_validate_byte(const struct sockdriver_data *data, socklen_t len, uint8_t *byte)
-{
-	return sockdriver_copyin_opt(data, byte, sizeof(*byte), len);
-}
-
-static void update_raw_flags(struct raw_pcb *pcb, unsigned int flag, int enable)
-{
-	unsigned int flags = raw_flags(pcb);
-	
-	if (enable)
-		flags |= flag;
-	else
-		flags &= ~flag;
-	
-	raw_setflags(pcb, flags);
-}
-
-static int handle_ip_hdrincl(struct rawsock *raw, const struct sockdriver_data *data, socklen_t len)
-{
-	int val, r;
-	
-	if ((r = copy_and_validate_int(data, len, &val)) != OK)
-		return r;
-	
-	update_raw_flags(raw->raw_pcb, RAW_FLAGS_HDRINCL, val);
-	return OK;
-}
-
-static int handle_ip_multicast_if(struct rawsock *raw, const struct sockdriver_data *data, socklen_t len)
-{
-	struct in_addr in_addr;
-	ip_addr_t ipaddr;
-	struct ifdev *ifdev;
-	int r;
-	
-	pktsock_set_mcaware(&raw->raw_pktsock);
-	
-	if ((r = sockdriver_copyin_opt(data, &in_addr, sizeof(in_addr), len)) != OK)
-		return r;
-	
-	ip_addr_set_ip4_u32(&ipaddr, in_addr.s_addr);
-	
-	if ((ifdev = ifaddr_map_by_addr(&ipaddr)) == NULL)
-		return EADDRNOTAVAIL;
-	
-	raw_set_multicast_netif_index(raw->raw_pcb, ifdev_get_index(ifdev));
-	return OK;
-}
-
-static int handle_multicast_loop(struct rawsock *raw, const struct sockdriver_data *data, socklen_t len, int is_ipv6)
-{
-	uint8_t byte;
-	int val, r;
-	
-	pktsock_set_mcaware(&raw->raw_pktsock);
-	
-	if (!is_ipv6) {
-		if ((r = copy_and_validate_byte(data, len, &byte)) != OK)
-			return r;
-		val = byte;
-	} else {
-		if ((r = copy_and_validate_int(data, len, &val)) != OK)
-			return r;
-		if (val < 0 || val > 1)
-			return EINVAL;
-	}
-	
-	update_raw_flags(raw->raw_pcb, RAW_FLAGS_MULTICAST_LOOP, val);
-	return OK;
-}
-
-static int handle_multicast_ttl(struct rawsock *raw, const struct sockdriver_data *data, socklen_t len)
-{
-	uint8_t byte;
-	int r;
-	
-	pktsock_set_mcaware(&raw->raw_pktsock);
-	
-	if ((r = copy_and_validate_byte(data, len, &byte)) != OK)
-		return r;
-	
-	raw_set_multicast_ttl(raw->raw_pcb, byte);
-	return OK;
-}
-
-static int handle_ipv6_checksum(struct rawsock *raw, const struct sockdriver_data *data, socklen_t len)
-{
-	int val, r;
-	
-	if (raw->raw_pcb->protocol == IPPROTO_ICMPV6)
-		return EINVAL;
-	
-	if ((r = copy_and_validate_int(data, len, &val)) != OK)
-		return r;
-	
-	if (val == -1) {
-		raw->raw_pcb->chksum_reqd = 0;
-		return OK;
-	}
-	
-	if (val >= 0 && !(val & 1)) {
-		raw->raw_pcb->chksum_reqd = 1;
-		raw->raw_pcb->chksum_offset = val;
-		return OK;
-	}
-	
-	return EINVAL;
-}
-
-static int handle_ipv6_multicast_if(struct rawsock *raw, const struct sockdriver_data *data, socklen_t len)
-{
-	struct ifdev *ifdev;
-	uint32_t ifindex;
-	int val, r;
-	
-	pktsock_set_mcaware(&raw->raw_pktsock);
-	
-	if ((r = copy_and_validate_int(data, len, &val)) != OK)
-		return r;
-	
-	if (val != 0) {
-		ifindex = (uint32_t)val;
-		ifdev = ifdev_get_by_index(ifindex);
-		if (ifdev == NULL)
-			return ENXIO;
-	} else {
-		ifindex = NETIF_NO_INDEX;
-	}
-	
-	raw_set_multicast_netif_index(raw->raw_pcb, ifindex);
-	return OK;
-}
-
-static int handle_ipv6_multicast_hops(struct rawsock *raw, const struct sockdriver_data *data, socklen_t len)
-{
-	int val, r;
-	
-	pktsock_set_mcaware(&raw->raw_pktsock);
-	
-	if ((r = copy_and_validate_int(data, len, &val)) != OK)
-		return r;
-	
-	if (val < -1 || val > UINT8_MAX)
-		return EINVAL;
-	
-	if (val == -1)
-		val = 1;
-	
-	raw_set_multicast_ttl(raw->raw_pcb, val);
-	return OK;
-}
-
-static int handle_icmp6_filter(struct rawsock *raw, const struct sockdriver_data *data, socklen_t len)
-{
-	struct icmp6_filter filter;
-	int r;
-	
-	if (len == 0) {
-		ICMP6_FILTER_SETPASSALL(&raw->raw_icmp6filter);
-		return OK;
-	}
-	
-	if ((r = sockdriver_copyin_opt(data, &filter, sizeof(filter), len)) != OK)
-		return r;
-	
-	memcpy(&raw->raw_icmp6filter, &filter, sizeof(filter));
-	return OK;
-}
-
-static int handle_ip_options(struct rawsock *raw, int name, const struct sockdriver_data *data, socklen_t len)
-{
-	switch (name) {
-	case IP_HDRINCL:
-		return handle_ip_hdrincl(raw, data, len);
-	case IP_MULTICAST_IF:
-		return handle_ip_multicast_if(raw, data, len);
-	case IP_MULTICAST_LOOP:
-		return handle_multicast_loop(raw, data, len, 0);
-	case IP_MULTICAST_TTL:
-		return handle_multicast_ttl(raw, data, len);
-	}
-	return -1;
-}
-
-static int handle_ipv6_options(struct rawsock *raw, int name, const struct sockdriver_data *data, socklen_t len)
-{
-	switch (name) {
-	case IPV6_CHECKSUM:
-		return handle_ipv6_checksum(raw, data, len);
-	case IPV6_MULTICAST_IF:
-		return handle_ipv6_multicast_if(raw, data, len);
-	case IPV6_MULTICAST_LOOP:
-		return handle_multicast_loop(raw, data, len, 1);
-	case IPV6_MULTICAST_HOPS:
-		return handle_ipv6_multicast_hops(raw, data, len);
-	}
-	return -1;
-}
-
-static int rawsock_setsockopt(struct sock *sock, int level, int name,
-	const struct sockdriver_data *data, socklen_t len)
+static int
+rawsock_setsockopt(struct sock * sock, int level, int name,
+	const struct sockdriver_data * data, socklen_t len)
 {
 	struct rawsock *raw = (struct rawsock *)sock;
 	struct ipopts ipopts;
-	int result;
-	
-	if (level == IPPROTO_IP && !rawsock_is_ipv6(raw)) {
-		result = handle_ip_options(raw, name, data, len);
-		if (result >= 0)
-			return result;
+	struct icmp6_filter filter;
+	ip_addr_t ipaddr;
+	struct in_addr in_addr;
+	struct ifdev *ifdev;
+	unsigned int flags;
+	uint32_t ifindex;
+	uint8_t byte;
+	int r, val;
+
+	/*
+	 * Unfortunately, we have to duplicate most of the multicast options
+	 * rather than sharing them with udpsock at the pktsock level.  The
+	 * reason is that each of the PCBs have their own multicast abstraction
+	 * functions and so we cannot merge the rest.  Same for getsockopt.
+	 */
+
+	switch (level) {
+	case IPPROTO_IP:
+		if (rawsock_is_ipv6(raw))
+			break;
+
+		switch (name) {
+		case IP_HDRINCL:
+			if ((r = sockdriver_copyin_opt(data, &val, sizeof(val),
+			    len)) != OK)
+				return r;
+
+			if (val) {
+				raw_setflags(raw->raw_pcb,
+				    raw_flags(raw->raw_pcb) |
+				    RAW_FLAGS_HDRINCL);
+			} else {
+				raw_setflags(raw->raw_pcb,
+				    raw_flags(raw->raw_pcb) &
+				    ~RAW_FLAGS_HDRINCL);
+			}
+
+			return OK;
+
+		case IP_MULTICAST_IF:
+			pktsock_set_mcaware(&raw->raw_pktsock);
+
+			if ((r = sockdriver_copyin_opt(data, &in_addr,
+			    sizeof(in_addr), len)) != OK)
+				return r;
+
+			ip_addr_set_ip4_u32(&ipaddr, in_addr.s_addr);
+
+			if ((ifdev = ifaddr_map_by_addr(&ipaddr)) == NULL)
+				return EADDRNOTAVAIL;
+
+			raw_set_multicast_netif_index(raw->raw_pcb,
+			    ifdev_get_index(ifdev));
+
+			return OK;
+
+		case IP_MULTICAST_LOOP:
+			pktsock_set_mcaware(&raw->raw_pktsock);
+
+			if ((r = sockdriver_copyin_opt(data, &byte,
+			    sizeof(byte), len)) != OK)
+				return r;
+
+			flags = raw_flags(raw->raw_pcb);
+
+			if (byte)
+				flags |= RAW_FLAGS_MULTICAST_LOOP;
+			else
+				flags &= ~RAW_FLAGS_MULTICAST_LOOP;
+
+			raw_setflags(raw->raw_pcb, flags);
+
+			return OK;
+
+		case IP_MULTICAST_TTL:
+			pktsock_set_mcaware(&raw->raw_pktsock);
+
+			if ((r = sockdriver_copyin_opt(data, &byte,
+			    sizeof(byte), len)) != OK)
+				return r;
+
+			raw_set_multicast_ttl(raw->raw_pcb, byte);
+
+			return OK;
+		}
+
+		break;
+
+	case IPPROTO_IPV6:
+		if (!rawsock_is_ipv6(raw))
+			break;
+
+		switch (name) {
+		case IPV6_CHECKSUM:
+			/* ICMPv6 checksums are always computed. */
+			if (raw->raw_pcb->protocol == IPPROTO_ICMPV6)
+				return EINVAL;
+
+			if ((r = sockdriver_copyin_opt(data, &val, sizeof(val),
+			    len)) != OK)
+				return r;
+
+			if (val == -1) {
+				raw->raw_pcb->chksum_reqd = 0;
+
+				return OK;
+			} else if (val >= 0 && !(val & 1)) {
+				raw->raw_pcb->chksum_reqd = 1;
+				raw->raw_pcb->chksum_offset = val;
+
+				return OK;
+			} else
+				return EINVAL;
+
+		case IPV6_MULTICAST_IF:
+			pktsock_set_mcaware(&raw->raw_pktsock);
+
+			if ((r = sockdriver_copyin_opt(data, &val, sizeof(val),
+			    len)) != OK)
+				return r;
+
+			if (val != 0) {
+				ifindex = (uint32_t)val;
+
+				ifdev = ifdev_get_by_index(ifindex);
+
+				if (ifdev == NULL)
+					return ENXIO;
+			} else
+				ifindex = NETIF_NO_INDEX;
+
+			raw_set_multicast_netif_index(raw->raw_pcb, ifindex);
+
+			return OK;
+
+		case IPV6_MULTICAST_LOOP:
+			pktsock_set_mcaware(&raw->raw_pktsock);
+
+			if ((r = sockdriver_copyin_opt(data, &val, sizeof(val),
+			    len)) != OK)
+				return r;
+
+			if (val < 0 || val > 1)
+				return EINVAL;
+
+			flags = raw_flags(raw->raw_pcb);
+
+			if (val)
+				flags |= RAW_FLAGS_MULTICAST_LOOP;
+			else
+				flags &= ~RAW_FLAGS_MULTICAST_LOOP;
+
+			/*
+			 * lwIP's IPv6 functionality does not actually check
+			 * this flag at all yet.  We set it in the hope that
+			 * one day this will magically start working.
+			 */
+			raw_setflags(raw->raw_pcb, flags);
+
+			return OK;
+
+		case IPV6_MULTICAST_HOPS:
+			pktsock_set_mcaware(&raw->raw_pktsock);
+
+			if ((r = sockdriver_copyin_opt(data, &val, sizeof(val),
+			    len)) != OK)
+				return r;
+
+			if (val < -1 || val > UINT8_MAX)
+				return EINVAL;
+
+			if (val == -1)
+				val = 1;
+
+			raw_set_multicast_ttl(raw->raw_pcb, val);
+
+			return OK;
+		}
+
+		break;
+
+	case IPPROTO_ICMPV6:
+		if (!rawsock_is_ipv6(raw) ||
+		    raw->raw_pcb->protocol != IPPROTO_ICMPV6)
+			break;
+
+		switch (name) {
+		case ICMP6_FILTER:
+			/* Who comes up with these stupid exceptions? */
+			if (len == 0) {
+				ICMP6_FILTER_SETPASSALL(&raw->raw_icmp6filter);
+
+				return OK;
+			}
+
+			if ((r = sockdriver_copyin_opt(data, &filter,
+			    sizeof(filter), len)) != OK)
+				return r;
+
+			/*
+			 * As always, never copy in the data into the actual
+			 * destination, as any copy may run into a copy fault
+			 * halfway through, potentially leaving the destination
+			 * in a half-updated and thus corrupted state.
+			 */
+			memcpy(&raw->raw_icmp6filter, &filter, sizeof(filter));
+
+			return OK;
+		}
 	}
-	
-	if (level == IPPROTO_IPV6 && rawsock_is_ipv6(raw)) {
-		result = handle_ipv6_options(raw, name, data, len);
-		if (result >= 0)
-			return result;
-	}
-	
-	if (level == IPPROTO_ICMPV6 && rawsock_is_ipv6(raw) &&
-	    raw->raw_pcb->protocol == IPPROTO_ICMPV6 && name == ICMP6_FILTER) {
-		return handle_icmp6_filter(raw, data, len);
-	}
-	
+
 	rawsock_get_ipopts(raw, &ipopts);
-	return pktsock_setsockopt(&raw->raw_pktsock, level, name, data, len, &ipopts);
+
+	return pktsock_setsockopt(&raw->raw_pktsock, level, name, data, len,
+	    &ipopts);
 }
 
 /*
  * Retrieve socket options on a raw socket.
  */
-static int get_ip_hdrincl(struct rawsock *raw, const struct sockdriver_data *data, socklen_t *len)
-{
-	int val = !!rawsock_is_hdrincl(raw);
-	return sockdriver_copyout_opt(data, &val, sizeof(val), len);
-}
-
-static int get_ip_multicast_if(struct rawsock *raw, const struct sockdriver_data *data, socklen_t *len)
-{
-	uint32_t ifindex = raw_get_multicast_netif_index(raw->raw_pcb);
-	struct ifdev *ifdev;
-	const ip4_addr_t *ip4addr;
-	struct in_addr in_addr;
-
-	if (ifindex != NETIF_NO_INDEX && (ifdev = ifdev_get_by_index(ifindex)) != NULL) {
-		ip4addr = netif_ip4_addr(ifdev_get_netif(ifdev));
-		in_addr.s_addr = ip4_addr_get_u32(ip4addr);
-	} else {
-		in_addr.s_addr = PP_HTONL(INADDR_ANY);
-	}
-
-	return sockdriver_copyout_opt(data, &in_addr, sizeof(in_addr), len);
-}
-
-static int get_multicast_loop(struct rawsock *raw, const struct sockdriver_data *data, socklen_t *len, int is_ipv6)
-{
-	unsigned int flags = raw_flags(raw->raw_pcb);
-	
-	if (is_ipv6) {
-		int val = !!(flags & RAW_FLAGS_MULTICAST_LOOP);
-		return sockdriver_copyout_opt(data, &val, sizeof(val), len);
-	} else {
-		uint8_t byte = !!(flags & RAW_FLAGS_MULTICAST_LOOP);
-		return sockdriver_copyout_opt(data, &byte, sizeof(byte), len);
-	}
-}
-
-static int get_multicast_ttl(struct rawsock *raw, const struct sockdriver_data *data, socklen_t *len, int is_ipv6)
-{
-	if (is_ipv6) {
-		int val = raw_get_multicast_ttl(raw->raw_pcb);
-		return sockdriver_copyout_opt(data, &val, sizeof(val), len);
-	} else {
-		uint8_t byte = raw_get_multicast_ttl(raw->raw_pcb);
-		return sockdriver_copyout_opt(data, &byte, sizeof(byte), len);
-	}
-}
-
-static int get_ipv6_checksum(struct rawsock *raw, const struct sockdriver_data *data, socklen_t *len)
-{
-	int val = raw->raw_pcb->chksum_reqd ? raw->raw_pcb->chksum_offset : -1;
-	return sockdriver_copyout_opt(data, &val, sizeof(val), len);
-}
-
-static int get_ipv6_multicast_if(struct rawsock *raw, const struct sockdriver_data *data, socklen_t *len)
-{
-	uint32_t ifindex = raw_get_multicast_netif_index(raw->raw_pcb);
-	int val = (int)ifindex;
-	return sockdriver_copyout_opt(data, &val, sizeof(val), len);
-}
-
-static int handle_ipv4_options(struct rawsock *raw, int name, const struct sockdriver_data *data, socklen_t *len)
-{
-	switch (name) {
-	case IP_HDRINCL:
-		return get_ip_hdrincl(raw, data, len);
-	case IP_MULTICAST_IF:
-		return get_ip_multicast_if(raw, data, len);
-	case IP_MULTICAST_LOOP:
-		return get_multicast_loop(raw, data, len, 0);
-	case IP_MULTICAST_TTL:
-		return get_multicast_ttl(raw, data, len, 0);
-	}
-	return -1;
-}
-
-static int handle_ipv6_options(struct rawsock *raw, int name, const struct sockdriver_data *data, socklen_t *len)
-{
-	switch (name) {
-	case IPV6_CHECKSUM:
-		return get_ipv6_checksum(raw, data, len);
-	case IPV6_MULTICAST_IF:
-		return get_ipv6_multicast_if(raw, data, len);
-	case IPV6_MULTICAST_LOOP:
-		return get_multicast_loop(raw, data, len, 1);
-	case IPV6_MULTICAST_HOPS:
-		return get_multicast_ttl(raw, data, len, 1);
-	}
-	return -1;
-}
-
-static int handle_icmpv6_options(struct rawsock *raw, int name, const struct sockdriver_data *data, socklen_t *len)
-{
-	if (name == ICMP6_FILTER) {
-		return sockdriver_copyout_opt(data, &raw->raw_icmp6filter,
-		    sizeof(raw->raw_icmp6filter), len);
-	}
-	return -1;
-}
-
-static int rawsock_getsockopt(struct sock *sock, int level, int name,
-	const struct sockdriver_data *data, socklen_t *len)
+static int
+rawsock_getsockopt(struct sock * sock, int level, int name,
+	const struct sockdriver_data * data, socklen_t * len)
 {
 	struct rawsock *raw = (struct rawsock *)sock;
 	struct ipopts ipopts;
-	int result = -1;
+	const ip4_addr_t *ip4addr;
+	struct in_addr in_addr;
+	struct ifdev *ifdev;
+	unsigned int flags;
+	uint32_t ifindex;
+	uint8_t byte;
+	int val;
 
 	switch (level) {
 	case IPPROTO_IP:
-		if (!rawsock_is_ipv6(raw))
-			result = handle_ipv4_options(raw, name, data, len);
+		if (rawsock_is_ipv6(raw))
+			break;
+
+		switch (name) {
+		case IP_HDRINCL:
+			val = !!rawsock_is_hdrincl(raw);
+
+			return sockdriver_copyout_opt(data, &val, sizeof(val),
+			    len);
+
+		case IP_MULTICAST_IF:
+			ifindex = raw_get_multicast_netif_index(raw->raw_pcb);
+
+			/*
+			 * Map back from the interface index to the IPv4
+			 * address assigned to the corresponding interface.
+			 * Should this not work out, return the 'any' address.
+			 */
+			if (ifindex != NETIF_NO_INDEX &&
+			   (ifdev = ifdev_get_by_index(ifindex)) != NULL) {
+				ip4addr =
+				    netif_ip4_addr(ifdev_get_netif(ifdev));
+
+				in_addr.s_addr = ip4_addr_get_u32(ip4addr);
+			} else
+				in_addr.s_addr = PP_HTONL(INADDR_ANY);
+
+			return sockdriver_copyout_opt(data, &in_addr,
+			    sizeof(in_addr), len);
+
+		case IP_MULTICAST_LOOP:
+			flags = raw_flags(raw->raw_pcb);
+
+			byte = !!(flags & RAW_FLAGS_MULTICAST_LOOP);
+
+			return sockdriver_copyout_opt(data, &byte,
+			    sizeof(byte), len);
+
+		case IP_MULTICAST_TTL:
+			byte = raw_get_multicast_ttl(raw->raw_pcb);
+
+			return sockdriver_copyout_opt(data, &byte,
+			    sizeof(byte), len);
+		}
+
 		break;
 
 	case IPPROTO_IPV6:
-		if (rawsock_is_ipv6(raw))
-			result = handle_ipv6_options(raw, name, data, len);
+		if (!rawsock_is_ipv6(raw))
+			break;
+
+		switch (name) {
+		case IPV6_CHECKSUM:
+			if (raw->raw_pcb->chksum_reqd)
+				val = raw->raw_pcb->chksum_offset;
+			else
+				val = -1;
+
+			return sockdriver_copyout_opt(data, &val, sizeof(val),
+			    len);
+
+		case IPV6_MULTICAST_IF:
+			ifindex = raw_get_multicast_netif_index(raw->raw_pcb);
+
+			val = (int)ifindex;
+
+			return sockdriver_copyout_opt(data, &val, sizeof(val),
+			    len);
+
+		case IPV6_MULTICAST_LOOP:
+			flags = raw_flags(raw->raw_pcb);
+
+			val = !!(flags & RAW_FLAGS_MULTICAST_LOOP);
+
+			return sockdriver_copyout_opt(data, &val, sizeof(val),
+			    len);
+
+		case IPV6_MULTICAST_HOPS:
+			val = raw_get_multicast_ttl(raw->raw_pcb);
+
+			return sockdriver_copyout_opt(data, &val, sizeof(val),
+			    len);
+		}
+
 		break;
 
 	case IPPROTO_ICMPV6:
-		if (rawsock_is_ipv6(raw) && raw->raw_pcb->protocol == IPPROTO_ICMPV6)
-			result = handle_icmpv6_options(raw, name, data, len);
+		if (!rawsock_is_ipv6(raw) ||
+		    raw->raw_pcb->protocol != IPPROTO_ICMPV6)
+			break;
+
+		switch (name) {
+		case ICMP6_FILTER:
+			return sockdriver_copyout_opt(data,
+			    &raw->raw_icmp6filter,
+			    sizeof(raw->raw_icmp6filter), len);
+		}
+
 		break;
 	}
 
-	if (result != -1)
-		return result;
-
 	rawsock_get_ipopts(raw, &ipopts);
-	return pktsock_getsockopt(&raw->raw_pktsock, level, name, data, len, &ipopts);
+
+	return pktsock_getsockopt(&raw->raw_pktsock, level, name, data, len,
+	    &ipopts);
 }
 
 /*
@@ -1310,7 +1179,7 @@ rawsock_getsockname(struct sock * sock, struct sockaddr * addr,
 	struct rawsock *raw = (struct rawsock *)sock;
 
 	ipsock_put_addr(rawsock_get_ipsock(raw), addr, addr_len,
-	    &raw->raw_pcb->local_ip, 0);
+	    &raw->raw_pcb->local_ip, 0 /*port*/);
 
 	return OK;
 }
@@ -1328,7 +1197,7 @@ rawsock_getpeername(struct sock * sock, struct sockaddr * addr,
 		return ENOTCONN;
 
 	ipsock_put_addr(rawsock_get_ipsock(raw), addr, addr_len,
-	    &raw->raw_pcb->remote_ip, 0);
+	    &raw->raw_pcb->remote_ip, 0 /*port*/);
 
 	return OK;
 }
@@ -1336,13 +1205,13 @@ rawsock_getpeername(struct sock * sock, struct sockaddr * addr,
 /*
  * Shut down a raw socket for reading and/or writing.
  */
-static int rawsock_shutdown(struct sock *sock, unsigned int mask)
+static int
+rawsock_shutdown(struct sock * sock, unsigned int mask)
 {
 	struct rawsock *raw = (struct rawsock *)sock;
 
-	if (mask & SFL_SHUT_RD) {
+	if (mask & SFL_SHUT_RD)
 		raw_recv(raw->raw_pcb, NULL, NULL);
-	}
 
 	pktsock_shutdown(&raw->raw_pktsock, mask);
 
@@ -1378,6 +1247,7 @@ rawsock_free(struct sock * sock)
 	assert(raw->raw_pcb == NULL);
 
 	TAILQ_REMOVE(&raw_activelist, raw, raw_next);
+
 	TAILQ_INSERT_HEAD(&raw_freelist, raw, raw_next);
 }
 
@@ -1391,6 +1261,7 @@ rawsock_get_info(struct kinfo_pcb * ki, const void * ptr)
 	const struct raw_pcb *pcb = (const struct raw_pcb *)ptr;
 	struct rawsock *raw;
 
+	/* We iterate our own list so we can't find "strange" PCBs. */
 	raw = (struct rawsock *)pcb->recv_arg;
 	assert(raw >= raw_array &&
 	    raw < &raw_array[__arraycount(raw_array)]);
@@ -1398,9 +1269,10 @@ rawsock_get_info(struct kinfo_pcb * ki, const void * ptr)
 	ki->ki_type = SOCK_RAW;
 	ki->ki_protocol = pcb->protocol;
 
-	ipsock_get_info(ki, &pcb->local_ip, 0,
-	    &raw->raw_pcb->remote_ip, 0);
+	ipsock_get_info(ki, &pcb->local_ip, 0 /*local_port*/,
+	    &raw->raw_pcb->remote_ip, 0 /*remote_port*/);
 
+	/* TODO: change this so that sockstat(1) may work one day. */
 	ki->ki_sockaddr = (uint64_t)(uintptr_t)rawsock_get_sock(raw);
 
 	ki->ki_rcvq = pktsock_get_recvlen(&raw->raw_pktsock);
@@ -1418,30 +1290,24 @@ rawsock_get_info(struct kinfo_pcb * ki, const void * ptr)
 static const void *
 rawsock_enum(const void * last)
 {
-	if (last == NULL)
-		return get_first_active_pcb();
+	const struct raw_pcb *pcb;
+	struct rawsock *raw;
 
-	return get_next_active_pcb(last);
-}
+	if (last != NULL) {
+		pcb = (const struct raw_pcb *)last;
 
-static const void *
-get_first_active_pcb(void)
-{
-	struct rawsock *raw = TAILQ_FIRST(&raw_activelist);
-	return raw != NULL ? raw->raw_pcb : NULL;
-}
+		raw = (struct rawsock *)pcb->recv_arg;
+		assert(raw >= raw_array &&
+		    raw < &raw_array[__arraycount(raw_array)]);
 
-static const void *
-get_next_active_pcb(const void *last)
-{
-	const struct raw_pcb *pcb = (const struct raw_pcb *)last;
-	struct rawsock *raw = (struct rawsock *)pcb->recv_arg;
-	
-	assert(raw >= raw_array &&
-	    raw < &raw_array[__arraycount(raw_array)]);
+		raw = TAILQ_NEXT(raw, raw_next);
+	} else
+		raw = TAILQ_FIRST(&raw_activelist);
 
-	raw = TAILQ_NEXT(raw, raw_next);
-	return raw != NULL ? raw->raw_pcb : NULL;
+	if (raw != NULL)
+		return raw->raw_pcb;
+	else
+		return NULL;
 }
 
 /*
@@ -1451,6 +1317,7 @@ static ssize_t
 rawsock_pcblist(struct rmib_call * call, struct rmib_node * node,
 	struct rmib_oldp * oldp, struct rmib_newp * newp __unused)
 {
+
 	return util_pcblist(call, oldp, rawsock_enum, rawsock_get_info);
 }
 
